@@ -17,7 +17,6 @@ jobs:
             TAG_NAME=$(date +%Y-%m-%d-%H-%M-%S)
             docker buildx build --platform linux/amd64,linux/arm64 \
               --file Dockerfile \
-              --progress plain \
               --tag $DOCKERHUB_USERNAME/graphhopper:${TAG_NAME} \
               $(if [ "$CIRCLE_BRANCH" = "master" ]; then echo '--push'; fi) .
 
