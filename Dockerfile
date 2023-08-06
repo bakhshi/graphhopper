@@ -1,4 +1,4 @@
-FROM maven:3.8.4-openjdk-8 as build
+FROM maven:3.9.3-eclipse-temurin-20 as build
 
 RUN apt-get install -y wget
 
@@ -6,9 +6,9 @@ WORKDIR /graphhopper
 
 COPY . .
 
-RUN mvn clean install -DskipTests=true -B
+RUN mvn clean install -DskipTests=true
 
-FROM openjdk:11.0-jre
+FROM openjdk:20
 
 ENV JAVA_OPTS "-Xmx1g -Xms1g -Ddw.server.application_connectors[0].bind_host=0.0.0.0 -Ddw.server.application_connectors[0].port=8989"
 
