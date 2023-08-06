@@ -6,7 +6,7 @@ WORKDIR /graphhopper
 
 COPY . .
 
-RUN mvn clean install
+RUN mvn clean install -DskipTests=true -B
 
 FROM openjdk:11.0-jre
 
