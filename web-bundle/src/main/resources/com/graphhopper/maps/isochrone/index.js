@@ -105,7 +105,7 @@ function _drawMap(bbox) {
         // add GraphHopper vector tiles of road network. this is also called when we change the style
         map.addSource('gh-mvt', {
             type: 'vector',
-            tiles: ['http://' + window.location.host + '/mvt/{z}/{x}/{y}.mvt?details=road_class']
+            tiles: ['http://' + window.location.host + '/mvt/{z}/{x}/{y}.mvt']
         });
         var boundsPolygon = [[bbox[0], bbox[1]], [bbox[2], bbox[1]], [bbox[2], bbox[3]], [bbox[0], bbox[3]], [bbox[0], bbox[1]]];
         map.addLayer({
@@ -202,7 +202,7 @@ function fetchAndDrawSPT(point) {
 function fetchAndDrawIsoline(point) {
     var radius = menu.isochroneRadius;
     var profile = menu.isochroneProfile;
-    fetch("/isochrone?profile=" + profile + "&point=" + point.lat + "," + point.lng + "&time_limit=" + radius)
+    fetch("/isochrone?profile=" + profile + "&point=" + point.lat + "," + point.lng + "&time_limit=" + radius + (profile === "pt" ? "&pt.earliest_departure_time=" + new Date().toISOString() : ""))
         .then(response => response.json())
         .then(data => {
             console.log('isoline took: ' + data.info.took + 'ms');

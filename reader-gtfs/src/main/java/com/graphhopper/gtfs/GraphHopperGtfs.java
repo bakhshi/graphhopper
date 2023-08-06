@@ -21,28 +21,25 @@ package com.graphhopper.gtfs;
 import com.conveyal.gtfs.model.Transfer;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.GraphHopperConfig;
-import com.graphhopper.routing.ev.EnumEncodedValue;
+import com.graphhopper.config.Profile;
+import com.graphhopper.routing.ev.*;
 import com.graphhopper.routing.querygraph.QueryGraph;
-import com.graphhopper.routing.util.AccessFilter;
+import com.graphhopper.routing.util.DefaultSnapFilter;
 import com.graphhopper.routing.weighting.Weighting;
-import com.graphhopper.storage.Directory;
-import com.graphhopper.storage.GraphHopperStorage;
-import com.graphhopper.storage.RAMDirectory;
-import com.graphhopper.storage.index.LocationIndex;
-import com.graphhopper.storage.index.LocationIndexTree;
-import com.graphhopper.util.EdgeExplorer;
-import com.graphhopper.util.EdgeIterator;
+import com.graphhopper.storage.index.InMemConstructionIndex;
+import com.graphhopper.storage.index.IndexStructureInfo;
+import com.graphhopper.storage.index.LineIntIndex;
 import com.graphhopper.util.EdgeIteratorState;
 import com.graphhopper.util.PMap;
+import com.graphhopper.util.shapes.BBox;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Paths;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class GraphHopperGtfs extends GraphHopper {
 
@@ -50,10 +47,10 @@ public class GraphHopperGtfs extends GraphHopper {
 
     private final GraphHopperConfig ghConfig;
     private GtfsStorage gtfsStorage;
+    private PtGraph ptGraph;
 
     public GraphHopperGtfs(GraphHopperConfig ghConfig) {
         this.ghConfig = ghConfig;
-        PtEncodedValues.createAndAddEncodedValues(getEncodingManagerBuilder());
     }
 
     @Override
@@ -61,33 +58,25 @@ public class GraphHopperGtfs extends GraphHopper {
         if (ghConfig.has("datareader.file")) {
             super.importOSM();
         } else {
-            getGraphHopperStorage().create(1000);
+            createBaseGraphAndProperties();
+            writeEncodingManagerToProperties();
         }
-    }
-
-    @Override
-    protected LocationIndex createLocationIndex(Directory dir) {
-        // if the location index was already created (we are 'loading') we use it. but we must not create the location
-        // index object in case the index does not exist yet, because we only can create it once. we are not ready yet,
-        // because first we need to import PT.
-        if (Files.exists(Paths.get(getGraphHopperLocation()).resolve("location_index"))) {
-            LocationIndexTree index = new LocationIndexTree(getGraphHopperStorage(), dir);
-            index.loadExisting();
-            return index;
-        }
-        return null;
     }
 
     @Override
     protected void importPublicTransit() {
-        gtfsStorage = new GtfsStorage(getGraphHopperStorage().getDirectory());
-        if (!getGtfsStorage().loadExisting()) {
+        ptGraph = new PtGraph(getBaseGraph().getDirectory(), 100);
+        gtfsStorage = new GtfsStorage(getBaseGraph().getDirectory());
+        LineIntIndex stopIndex = new LineIntIndex(new BBox(-180.0, 180.0, -90.0, 90.0), getBaseGraph().getDirectory(), "stop_index");
+        if (getGtfsStorage().loadExisting()) {
+            ptGraph.loadExisting();
+            stopIndex.loadExisting();
+        } else {
             ensureWriteAccess();
             getGtfsStorage().create();
-            GraphHopperStorage graphHopperStorage = getGraphHopperStorage();
-            // temporary location index for the street network that we only use during import
-            LocationIndexTree streetNetworkIndex = new LocationIndexTree(getGraphHopperStorage(), new RAMDirectory());
-            streetNetworkIndex.prepareIndex();
+            ptGraph.create(100);
+            InMemConstructionIndex indexBuilder = new InMemConstructionIndex(IndexStructureInfo.create(
+                    new BBox(-180.0, 180.0, -90.0, 90.0), 300));
             try {
                 int idx = 0;
                 List<String> gtfsFiles = ghConfig.has("gtfs.file") ? Arrays.asList(ghConfig.getString("gtfs.file", "").split(",")) : Collections.emptyList();
@@ -100,8 +89,17 @@ public class GraphHopperGtfs extends GraphHopper {
                 getGtfsStorage().getGtfsFeeds().forEach((id, gtfsFeed) -> {
                     Transfers transfers = new Transfers(gtfsFeed);
                     allTransfers.put(id, transfers);
-                    GtfsReader gtfsReader = new GtfsReader(id, graphHopperStorage, graphHopperStorage.getEncodingManager(), getGtfsStorage(), streetNetworkIndex, transfers);
-                    gtfsReader.connectStopsToStreetNetwork();
+                    GtfsReader gtfsReader = new GtfsReader(id, ptGraph, ptGraph, getGtfsStorage(), getLocationIndex(), transfers, indexBuilder);
+                    // Stops must be connected to the networks of all the modes
+                    List<DefaultSnapFilter> snapFilters = getProfiles().stream().map(p ->
+                            new DefaultSnapFilter(createWeighting(p, new PMap()), getEncodingManager().getBooleanEncodedValue(Subnetwork.key(p.getName())))).collect(Collectors.toList());
+                    gtfsReader.connectStopsToStreetNetwork(e -> {
+                        for (DefaultSnapFilter snapFilter : snapFilters) {
+                            if (!snapFilter.accept(e))
+                                return false;
+                        }
+                        return true;
+                    });
                     LOGGER.info("Building transit graph for feed {}", gtfsFeed.feedId);
                     gtfsReader.buildPtNetwork();
                     allReaders.put(id, gtfsReader);
@@ -110,52 +108,41 @@ public class GraphHopperGtfs extends GraphHopper {
             } catch (Exception e) {
                 throw new RuntimeException("Error while constructing transit network. Is your GTFS file valid? Please check log for possible causes.", e);
             }
-            streetNetworkIndex.close();
-            // now we build the final location index
-            LocationIndexTree locationIndex = new LocationIndexTree(getGraphHopperStorage(), getGraphHopperStorage().getDirectory());
-            PtEncodedValues ptEncodedValues = PtEncodedValues.fromEncodingManager(getEncodingManager());
-            EnumEncodedValue<GtfsStorage.EdgeType> typeEnc = ptEncodedValues.getTypeEnc();
-            locationIndex.prepareIndex(edgeState -> edgeState.get(typeEnc) == GtfsStorage.EdgeType.HIGHWAY);
-            setLocationIndex(locationIndex);
+            ptGraph.flush();
+            getGtfsStorage().flush();
+            stopIndex.store(indexBuilder);
+            stopIndex.flush();
         }
+        gtfsStorage.setStopIndex(stopIndex);
+        gtfsStorage.setPtGraph(ptGraph);
     }
 
     private void interpolateTransfers(HashMap<String, GtfsReader> readers, Map<String, Transfers> allTransfers) {
         LOGGER.info("Looking for transfers");
         final int maxTransferWalkTimeSeconds = ghConfig.getInt("gtfs.max_transfer_interpolation_walk_time_seconds", 120);
-        GraphHopperStorage graphHopperStorage = getGraphHopperStorage();
-        QueryGraph queryGraph = QueryGraph.create(graphHopperStorage, Collections.emptyList());
+        QueryGraph queryGraph = QueryGraph.create(getBaseGraph(), Collections.emptyList());
         Weighting transferWeighting = createWeighting(getProfile("foot"), new PMap());
-        PtEncodedValues ptEncodedValues = PtEncodedValues.fromEncodingManager(graphHopperStorage.getEncodingManager());
-        final GraphExplorer graphExplorer = new GraphExplorer(queryGraph, transferWeighting, ptEncodedValues, getGtfsStorage(), RealtimeFeed.empty(getGtfsStorage()), true, true, false, 5.0, false, 0);
-        getGtfsStorage().getStationNodes().values().stream().distinct().forEach(stationNode -> {
-            MultiCriteriaLabelSetting router = new MultiCriteriaLabelSetting(graphExplorer, ptEncodedValues, true, false, false, 0, new ArrayList<>());
+        final GraphExplorer graphExplorer = new GraphExplorer(queryGraph, ptGraph, transferWeighting, getGtfsStorage(), RealtimeFeed.empty(), true, true, false, 5.0, false, 0);
+        getGtfsStorage().getStationNodes().values().stream().distinct().map(n -> new Label.NodeId(gtfsStorage.getPtToStreet().getOrDefault(n, -1), n)).forEach(stationNode -> {
+            MultiCriteriaLabelSetting router = new MultiCriteriaLabelSetting(graphExplorer, true, false, false, 0, new ArrayList<>());
             router.setLimitStreetTime(Duration.ofSeconds(maxTransferWalkTimeSeconds).toMillis());
-            Iterator<Label> iterator = router.calcLabels(stationNode, Instant.ofEpochMilli(0)).iterator();
-            while (iterator.hasNext()) {
-                Label label = iterator.next();
+            for (Label label : router.calcLabels(stationNode, Instant.ofEpochMilli(0))) {
                 if (label.parent != null) {
-                    EdgeIteratorState edgeIteratorState = graphHopperStorage.getEdgeIteratorState(label.edge, label.adjNode);
-                    if (edgeIteratorState.get(ptEncodedValues.getTypeEnc()) == GtfsStorage.EdgeType.EXIT_PT) {
-                        GtfsStorageI.PlatformDescriptor fromPlatformDescriptor = getGtfsStorage().getPlatformDescriptorByEdge().get(label.edge);
+                    if (label.edge.getType() == GtfsStorage.EdgeType.EXIT_PT) {
+                        GtfsStorage.PlatformDescriptor fromPlatformDescriptor = label.edge.getPlatformDescriptor();
                         Transfers transfers = allTransfers.get(fromPlatformDescriptor.feed_id);
-                        AccessFilter filter = AccessFilter.outEdges(ptEncodedValues.getAccessEnc());
-                        EdgeExplorer edgeExplorer = graphHopperStorage.createEdgeExplorer(filter);
-                        EdgeIterator edgeIterator = edgeExplorer.setBaseNode(stationNode);
-                        while (edgeIterator.next()) {
-                            if (edgeIterator.get(ptEncodedValues.getTypeEnc()) == GtfsStorage.EdgeType.ENTER_PT) {
-                                GtfsStorageI.PlatformDescriptor toPlatformDescriptor = getGtfsStorage().getPlatformDescriptorByEdge().get(edgeIterator.getEdge());
+                        for (PtGraph.PtEdge ptEdge : ptGraph.edgesAround(stationNode.ptNode)) {
+                            if (ptEdge.getType() == GtfsStorage.EdgeType.ENTER_PT) {
+                                GtfsStorage.PlatformDescriptor toPlatformDescriptor = ptEdge.getAttrs().platformDescriptor;
                                 LOGGER.debug(fromPlatformDescriptor + " -> " + toPlatformDescriptor);
                                 if (!toPlatformDescriptor.feed_id.equals(fromPlatformDescriptor.feed_id)) {
                                     LOGGER.debug(" Different feed. Inserting transfer with " + (int) (label.streetTime / 1000L) + " s.");
-                                    GtfsReader toFeedReader = readers.get(toPlatformDescriptor.feed_id);
-                                    toFeedReader.insertTransferEdges(label.adjNode, (int) (label.streetTime / 1000L), toPlatformDescriptor);
+                                    insertInterpolatedTransfer(label, toPlatformDescriptor, readers);
                                 } else {
                                     List<Transfer> transfersToStop = transfers.getTransfersToStop(toPlatformDescriptor.stop_id, routeIdOrNull(toPlatformDescriptor));
                                     if (transfersToStop.stream().noneMatch(t -> t.from_stop_id.equals(fromPlatformDescriptor.stop_id))) {
-                                        GtfsReader toFeedReader = readers.get(toPlatformDescriptor.feed_id);
-                                        toFeedReader.insertTransferEdges(label.adjNode, (int) (label.streetTime / 1000L), toPlatformDescriptor);
                                         LOGGER.debug("  Inserting transfer with " + (int) (label.streetTime / 1000L) + " s.");
+                                        insertInterpolatedTransfer(label, toPlatformDescriptor, readers);
                                     }
                                 }
                             }
@@ -166,11 +153,39 @@ public class GraphHopperGtfs extends GraphHopper {
         });
     }
 
-    private String routeIdOrNull(GtfsStorageI.PlatformDescriptor platformDescriptor) {
-        if (platformDescriptor instanceof GtfsStorageI.RouteTypePlatform) {
+    private void insertInterpolatedTransfer(Label label, GtfsStorage.PlatformDescriptor toPlatformDescriptor, HashMap<String, GtfsReader> readers) {
+        GtfsReader toFeedReader = readers.get(toPlatformDescriptor.feed_id);
+        List<Integer> transferEdgeIds = toFeedReader.insertTransferEdges(label.node.ptNode, (int) (label.streetTime / 1000L), toPlatformDescriptor);
+        List<Label.Transition> transitions = Label.getTransitions(label.parent, true);
+        int[] skippedEdgesForTransfer = transitions.stream().filter(t -> t.edge != null).mapToInt(t -> {
+            Label.NodeId adjNode = t.label.node;
+            EdgeIteratorState edgeIteratorState = getBaseGraph().getEdgeIteratorState(t.edge.getId(), adjNode.streetNode);
+            return edgeIteratorState.getEdgeKey();
+        }).toArray();
+        if (skippedEdgesForTransfer.length > 0) { // TODO: Elsewhere, we distinguish empty path ("at" a node) from no path
+            assert isValidPath(skippedEdgesForTransfer);
+            for (Integer transferEdgeId : transferEdgeIds) {
+                gtfsStorage.getSkippedEdgesForTransfer().put(transferEdgeId, skippedEdgesForTransfer);
+            }
+        }
+    }
+
+    private boolean isValidPath(int[] edgeKeys) {
+        List<EdgeIteratorState> edges = Arrays.stream(edgeKeys).mapToObj(i -> getBaseGraph().getEdgeIteratorStateForKey(i)).collect(Collectors.toList());
+        for (int i = 1; i < edges.size(); i++) {
+            if (edges.get(i).getBaseNode() != edges.get(i-1).getAdjNode())
+                return false;
+        }
+        TripFromLabel tripFromLabel = new TripFromLabel(getBaseGraph(), getEncodingManager(), gtfsStorage, RealtimeFeed.empty(), getPathDetailsBuilderFactory(), 6.0);
+        tripFromLabel.transferPath(edgeKeys, createWeighting(getProfile("foot"), new PMap()), 0L);
+        return true;
+    }
+
+    private String routeIdOrNull(GtfsStorage.PlatformDescriptor platformDescriptor) {
+        if (platformDescriptor instanceof GtfsStorage.RouteTypePlatform) {
             return null;
         } else {
-            return ((GtfsStorageI.RoutePlatform) platformDescriptor).route_id;
+            return ((GtfsStorage.RoutePlatform) platformDescriptor).route_id;
         }
     }
 
@@ -184,4 +199,7 @@ public class GraphHopperGtfs extends GraphHopper {
         return gtfsStorage;
     }
 
+    public PtGraph getPtGraph() {
+        return ptGraph;
+    }
 }

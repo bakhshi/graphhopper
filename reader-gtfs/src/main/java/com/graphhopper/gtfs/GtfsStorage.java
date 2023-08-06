@@ -18,36 +18,58 @@
 
 package com.graphhopper.gtfs;
 
+import com.carrotsearch.hppc.IntIntHashMap;
+import com.carrotsearch.hppc.IntObjectHashMap;
+import com.carrotsearch.hppc.cursors.IntIntCursor;
+import com.carrotsearch.hppc.cursors.IntObjectCursor;
 import com.conveyal.gtfs.GTFSFeed;
 import com.conveyal.gtfs.model.Fare;
-import com.google.transit.realtime.GtfsRealtime;
 import com.graphhopper.storage.Directory;
-import org.mapdb.Bind;
+import com.graphhopper.storage.index.LineIntIndex;
 import org.mapdb.DB;
 import org.mapdb.DBMaker;
-import org.mapdb.HTreeMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.Serializable;
+import java.io.*;
 import java.nio.file.Files;
+import java.nio.file.Paths;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.*;
-import java.util.zip.ZipFile;
 
-public class GtfsStorage implements GtfsStorageI {
+public class GtfsStorage {
 
 	private static final Logger LOGGER = LoggerFactory.getLogger(GtfsStorage.class);
+	private LineIntIndex stopIndex;
+	private PtGraph ptGraph;
+
+	public void setStopIndex(LineIntIndex stopIndex) {
+		this.stopIndex = stopIndex;
+	}
+
+	public LineIntIndex getStopIndex() {
+		return stopIndex;
+	}
+
+    public PtGraph getPtGraph() {
+        return ptGraph;
+    }
+
+    public void setPtGraph(PtGraph ptGraph) {
+        this.ptGraph = ptGraph;
+    }
+
+	public IntObjectHashMap<int[]> getSkippedEdgesForTransfer() {
+		return skippedEdgesForTransfer;
+	}
 
 	public static class Validity implements Serializable {
 		final BitSet validity;
 		final ZoneId zoneId;
 		final LocalDate start;
 
-		Validity(BitSet validity, ZoneId zoneId, LocalDate start) {
+		public Validity(BitSet validity, ZoneId zoneId, LocalDate start) {
 			this.validity = validity;
 			this.zoneId = zoneId;
 			this.start = start;
@@ -89,11 +111,11 @@ public class GtfsStorage implements GtfsStorageI {
 
 	}
 
-	static class FeedIdWithStopId implements Serializable {
-		final String feedId;
-		final String stopId;
+	public static class FeedIdWithStopId implements Serializable {
+		public final String feedId;
+		public final String stopId;
 
-		FeedIdWithStopId(String feedId, String stopId) {
+		public FeedIdWithStopId(String feedId, String stopId) {
 			this.feedId = feedId;
 			this.stopId = stopId;
 		}
@@ -111,25 +133,26 @@ public class GtfsStorage implements GtfsStorageI {
 		public int hashCode() {
 			return Objects.hash(feedId, stopId);
 		}
+
+		@Override
+		public String toString() {
+			return "FeedIdWithStopId{" +
+					"feedId='" + feedId + '\'' +
+					", stopId='" + stopId + '\'' +
+					'}';
+		}
 	}
 
 	private boolean isClosed = false;
 	private Directory dir;
 	private Set<String> gtfsFeedIds;
 	private Map<String, GTFSFeed> gtfsFeeds = new HashMap<>();
-	private HTreeMap<Validity, Integer> operatingDayPatterns;
-	private Bind.MapWithModificationListener<FeedIdWithTimezone, Integer> timeZones;
-	private Map<Integer, FeedIdWithTimezone> readableTimeZones;
-	private Map<Integer, byte[]> tripDescriptors;
-	private Map<Integer, Integer> stopSequences;
-
-	private Map<Integer, PlatformDescriptor> platformDescriptorsByEdge;
-
 	private Map<String, Map<String, Fare>> faresByFeed;
-	private Map<String, int[]> boardEdgesForTrip;
-	private Map<String, int[]> leaveEdgesForTrip;
-
 	private Map<FeedIdWithStopId, Integer> stationNodes;
+	private IntObjectHashMap<int[]> skippedEdgesForTransfer;
+
+	private IntIntHashMap ptToStreet;
+	private IntIntHashMap streetToPt;
 
 	public enum EdgeType {
 		HIGHWAY, ENTER_TIME_EXPANDED_NETWORK, LEAVE_TIME_EXPANDED_NETWORK, ENTER_PT, EXIT_PT, HOP, DWELL, BOARD, ALIGHT, OVERNIGHT, TRANSFER, WAIT, WAIT_ARRIVAL
@@ -160,8 +183,40 @@ public class GtfsStorage implements GtfsStorageI {
 			GTFSFeed feed = new GTFSFeed(dbFile);
 			this.gtfsFeeds.put(gtfsFeedId, feed);
 		}
+		ptToStreet = deserialize("pt_to_street");
+		streetToPt = deserialize("street_to_pt");
+		skippedEdgesForTransfer = deserializeIntoIntObjectHashMap("skipped_edges_for_transfer");
 		postInit();
 		return true;
+	}
+
+
+	private IntIntHashMap deserialize(String filename) {
+		try (FileInputStream in = new FileInputStream(dir.getLocation() + filename)) {
+			ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(in));
+			int size = ois.readInt();
+			IntIntHashMap result = new IntIntHashMap();
+			for (int i = 0; i < size; i++) {
+				result.put(ois.readInt(), ois.readInt());
+			}
+			return result;
+		} catch (IOException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	private IntObjectHashMap<int[]> deserializeIntoIntObjectHashMap(String filename) {
+		try (FileInputStream in = new FileInputStream(dir.getLocation() + filename)) {
+			ObjectInputStream ois = new ObjectInputStream(new BufferedInputStream(in));
+			int size = ois.readInt();
+			IntObjectHashMap<int[]> result = new IntObjectHashMap<>();
+			for (int i = 0; i < size; i++) {
+				result.put(ois.readInt(), ((int[]) ois.readObject()));
+			}
+			return result;
+		} catch (IOException | ClassNotFoundException e) {
+			throw new RuntimeException(e);
+		}
 	}
 
 	void create() {
@@ -178,20 +233,10 @@ public class GtfsStorage implements GtfsStorageI {
 
     private void init() {
 		this.gtfsFeedIds = data.getHashSet("gtfsFeeds");
-		this.operatingDayPatterns = data.getHashMap("validities");
-		this.timeZones = data.getHashMap("timeZones");
-		Map<Integer, FeedIdWithTimezone> readableTimeZones = new HashMap<>();
-		for (Map.Entry<FeedIdWithTimezone, Integer> entry : this.timeZones.entrySet()) {
-			readableTimeZones.put(entry.getValue(), entry.getKey());
-		}
-		Bind.mapInverse(this.timeZones, readableTimeZones);
-		this.readableTimeZones = Collections.unmodifiableMap(readableTimeZones);
-		this.tripDescriptors = data.getTreeMap("tripDescriptors");
-		this.stopSequences = data.getTreeMap("stopSequences");
-		this.boardEdgesForTrip = data.getHashMap("boardEdgesForTrip");
-		this.leaveEdgesForTrip = data.getHashMap("leaveEdgesForTrip");
 		this.stationNodes = data.getHashMap("stationNodes");
-		this.platformDescriptorsByEdge = data.getHashMap("routes");
+		this.ptToStreet = new IntIntHashMap();
+		this.streetToPt = new IntIntHashMap();
+		this.skippedEdgesForTransfer = new IntObjectHashMap<>();
 	}
 
 	void loadGtfsFromZipFileOrDirectory(String id, File zipFileOrDirectory) {
@@ -226,66 +271,143 @@ public class GtfsStorage implements GtfsStorageI {
 		}
 	}
 
-    @Override
-	public Map<Validity, Integer> getOperatingDayPatterns() {
-        return operatingDayPatterns;
-    }
-
-    @Override
-	public Map<Integer, FeedIdWithTimezone> getTimeZones() {
-		return readableTimeZones;
-	}
-
-	@Override
-	public Map<FeedIdWithTimezone, Integer> getWritableTimeZones() {
-		return timeZones;
-	}
-
-	@Override
-	public Map<Integer, byte[]> getTripDescriptors() {
-		return tripDescriptors;
-	}
-
-	@Override
-	public Map<Integer, Integer> getStopSequences() {
-		return stopSequences;
-	}
-
-	@Override
-	public Map<String, int[]> getBoardEdgesForTrip() {
-		return boardEdgesForTrip;
-	}
-
-	@Override
-	public Map<String, int[]> getAlightEdgesForTrip() {
-		return leaveEdgesForTrip;
-	}
-
-    @Override
-    public Map<Integer, PlatformDescriptor> getPlatformDescriptorByEdge() {
-        return platformDescriptorsByEdge;
-    }
-
-    @Override
 	public Map<String, Map<String, Fare>> getFares() {
 		return faresByFeed;
+	}
+
+	public IntIntHashMap getPtToStreet() {
+		return ptToStreet;
+	}
+
+	public IntIntHashMap getStreetToPt() {
+		return streetToPt;
 	}
 
 	public Map<String, GTFSFeed> getGtfsFeeds() {
 		return Collections.unmodifiableMap(gtfsFeeds);
 	}
 
-	@Override
 	public Map<FeedIdWithStopId, Integer> getStationNodes() {
 		return stationNodes;
 	}
 
-	static String tripKey(GtfsRealtime.TripDescriptor tripDescriptor, boolean isFrequencyBased) {
-		if (isFrequencyBased) {
-			return tripDescriptor.getTripId()+tripDescriptor.getStartTime();
-		} else {
-			return tripDescriptor.getTripId();
+	public void flush() {
+		serialize("pt_to_street", ptToStreet);
+		serialize("street_to_pt", streetToPt);
+		serialize("skipped_edges_for_transfer", skippedEdgesForTransfer);
+	}
+
+	private void serialize(String filename, IntObjectHashMap<int[]> data) {
+		try (ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(Files.newOutputStream(Paths.get(dir.getLocation() + filename))))) {
+			oos.writeInt(data.size());
+			for (IntObjectCursor<int[]> e : data) {
+				oos.writeInt(e.key);
+				oos.writeObject(e.value);
+			}
+		} catch (IOException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
+	private void serialize(String filename, IntIntHashMap data) {
+		try (ObjectOutputStream oos = new ObjectOutputStream(new BufferedOutputStream(Files.newOutputStream(Paths.get(dir.getLocation() + filename))))) {
+			oos.writeInt(data.size());
+			for (IntIntCursor e : data) {
+				oos.writeInt(e.key);
+				oos.writeInt(e.value);
+			}
+		} catch (IOException e) {
+			throw new RuntimeException(e);
+		}
+	}
+
+	public abstract static class PlatformDescriptor implements Serializable {
+		public String feed_id;
+		public String stop_id;
+
+		public static PlatformDescriptor route(String feed_id, String stop_id, String route_id) {
+			RoutePlatform routePlatform = new RoutePlatform();
+			routePlatform.feed_id = feed_id;
+			routePlatform.stop_id = stop_id;
+			routePlatform.route_id = route_id;
+			return routePlatform;
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) return true;
+			if (o == null || getClass() != o.getClass()) return false;
+			PlatformDescriptor that = (PlatformDescriptor) o;
+			return Objects.equals(feed_id, that.feed_id) &&
+					Objects.equals(stop_id, that.stop_id);
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(feed_id, stop_id);
+		}
+
+		public static RouteTypePlatform routeType(String feed_id, String stop_id, int route_type) {
+			RouteTypePlatform routeTypePlatform = new RouteTypePlatform();
+			routeTypePlatform.feed_id = feed_id;
+			routeTypePlatform.stop_id = stop_id;
+			routeTypePlatform.route_type = route_type;
+			return routeTypePlatform;
+		}
+
+	}
+
+	public static class RoutePlatform extends PlatformDescriptor {
+		String route_id;
+
+		@Override
+		public String toString() {
+			return "RoutePlatform{" +
+					"feed_id='" + feed_id + '\'' +
+					", stop_id='" + stop_id + '\'' +
+					", route_id='" + route_id + '\'' +
+					'}';
+		}
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) return true;
+			if (o == null || getClass() != o.getClass()) return false;
+			if (!super.equals(o)) return false;
+			RoutePlatform that = (RoutePlatform) o;
+			return route_id.equals(that.route_id);
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(super.hashCode(), route_id);
+		}
+	}
+
+	public static class RouteTypePlatform extends PlatformDescriptor {
+		int route_type;
+
+		@Override
+		public boolean equals(Object o) {
+			if (this == o) return true;
+			if (o == null || getClass() != o.getClass()) return false;
+			if (!super.equals(o)) return false;
+			RouteTypePlatform that = (RouteTypePlatform) o;
+			return route_type == that.route_type;
+		}
+
+		@Override
+		public int hashCode() {
+			return Objects.hash(super.hashCode(), route_type);
+		}
+
+		@Override
+		public String toString() {
+			return "RouteTypePlatform{" +
+					"feed_id='" + feed_id + '\'' +
+					", stop_id='" + stop_id + '\'' +
+					", route_type=" + route_type +
+					'}';
+		}
+	}
 }

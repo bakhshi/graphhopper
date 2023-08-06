@@ -18,17 +18,8 @@
 package com.graphhopper.routing.util.parsers;
 
 import com.graphhopper.reader.ReaderWay;
-import com.graphhopper.routing.ev.DecimalEncodedValue;
-import com.graphhopper.routing.ev.MaxSpeed;
-import com.graphhopper.routing.util.EncodingManager;
-import com.graphhopper.routing.util.FlagEncoder;
-import com.graphhopper.routing.util.TransportationMode;
-import com.graphhopper.routing.util.countryrules.CountryRule;
-import com.graphhopper.storage.Graph;
-import com.graphhopper.storage.GraphBuilder;
+import com.graphhopper.routing.ev.*;
 import com.graphhopper.storage.IntsRef;
-import com.graphhopper.util.EdgeIteratorState;
-import com.graphhopper.util.GHUtility;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -37,29 +28,27 @@ class OSMMaxSpeedParserTest {
 
     @Test
     void countryRule() {
-        EncodingManager em = EncodingManager.create("car");
-        DecimalEncodedValue maxSpeedEnc = em.getDecimalEncodedValue(MaxSpeed.KEY);
-        Graph graph = new GraphBuilder(em).create();
-        FlagEncoder encoder = em.getEncoder("car");
-        EdgeIteratorState e1 = GHUtility.setSpeed(60, true, true, encoder, graph.edge(0, 1).setDistance(100));
-        EdgeIteratorState e2 = GHUtility.setSpeed(60, true, true, encoder, graph.edge(1, 2).setDistance(100));
+        DecimalEncodedValue maxSpeedEnc = MaxSpeed.create();
+        maxSpeedEnc.init(new EncodedValue.InitializerConfig());
         OSMMaxSpeedParser parser = new OSMMaxSpeedParser(maxSpeedEnc);
-        IntsRef relFlags = em.createRelationFlags();
+        IntsRef relFlags = new IntsRef(2);
         ReaderWay way = new ReaderWay(29L);
-        way.setTag("highway", "living_street");
-        way.setTag("country_rule", new CountryRule() {
-            @Override
-            public double getMaxSpeed(ReaderWay readerWay, TransportationMode transportationMode, double currentMaxSpeed) {
-                return 5;
-            }
-        });
-        parser.handleWayTags(e1.getFlags(), way, relFlags);
-        assertEquals(5, e1.get(maxSpeedEnc), .1);
+        way.setTag("highway", "primary");
+        EdgeIntAccess edgeIntAccess = new ArrayEdgeIntAccess(1);
+        int edgeId = 0;
+        way.setTag("maxspeed", "30");
+        parser.handleWayTags(edgeId, edgeIntAccess, way, relFlags);
+        assertEquals(30, maxSpeedEnc.getDecimal(false, edgeId, edgeIntAccess), .1);
 
-        // without a country_rule we get the default value
-        way.removeTag("country_rule");
-        parser.handleWayTags(e2.getFlags(), way, relFlags);
-        assertEquals(MaxSpeed.UNSET_SPEED, e2.get(maxSpeedEnc), .1);
+        // different direction
+        edgeIntAccess = new ArrayEdgeIntAccess(1);
+        way = new ReaderWay(29L);
+        way.setTag("highway", "primary");
+        way.setTag("maxspeed:forward", "30");
+        way.setTag("maxspeed:backward", "40");
+        parser.handleWayTags(edgeId, edgeIntAccess, way, relFlags);
+        assertEquals(30, maxSpeedEnc.getDecimal(false, edgeId, edgeIntAccess), .1);
+        assertEquals(40, maxSpeedEnc.getDecimal(true, edgeId, edgeIntAccess), .1);
     }
 
 }

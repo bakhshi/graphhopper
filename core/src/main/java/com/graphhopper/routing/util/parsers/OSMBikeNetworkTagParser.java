@@ -23,23 +23,22 @@ import com.graphhopper.routing.ev.*;
 import com.graphhopper.storage.IntsRef;
 import com.graphhopper.util.Helper;
 
-import java.util.List;
-
 import static com.graphhopper.routing.util.EncodingManager.getKey;
 
 public class OSMBikeNetworkTagParser implements RelationTagParser {
-    private EnumEncodedValue<RouteNetwork> bikeRouteEnc;
+    private final EnumEncodedValue<RouteNetwork> bikeRouteEnc;
     // used only for internal transformation from relations into edge flags
-    private EnumEncodedValue<RouteNetwork> transformerRouteRelEnc;
+    private final EnumEncodedValue<RouteNetwork> transformerRouteRelEnc = new EnumEncodedValue<>(getKey("bike", "route_relation"), RouteNetwork.class);
 
-    @Override
-    public void createRelationEncodedValues(EncodedValueLookup lookup, List<EncodedValue> registerNewEncodedValue) {
-        registerNewEncodedValue.add(transformerRouteRelEnc = new EnumEncodedValue<>(getKey("bike", "route_relation"), RouteNetwork.class));
+    public OSMBikeNetworkTagParser(EnumEncodedValue<RouteNetwork> bikeRouteEnc, EncodedValue.InitializerConfig relConfig) {
+        this.bikeRouteEnc = bikeRouteEnc;
+        this.transformerRouteRelEnc.init(relConfig);
     }
 
     @Override
-    public IntsRef handleRelationTags(IntsRef relFlags, ReaderRelation relation) {
-        RouteNetwork oldBikeNetwork = transformerRouteRelEnc.getEnum(false, relFlags);
+    public void handleRelationTags(IntsRef relFlags, ReaderRelation relation) {
+        IntsRefEdgeIntAccess relIntAccess = new IntsRefEdgeIntAccess(relFlags);
+        RouteNetwork oldBikeNetwork = transformerRouteRelEnc.getEnum(false, -1, relIntAccess);
         if (relation.hasTag("route", "bicycle")) {
             String tag = Helper.toLowerCase(relation.getTag("network", ""));
             RouteNetwork newBikeNetwork = RouteNetwork.LOCAL;
@@ -53,22 +52,19 @@ public class OSMBikeNetworkTagParser implements RelationTagParser {
                 newBikeNetwork = RouteNetwork.INTERNATIONAL;
             }
             if (oldBikeNetwork == RouteNetwork.MISSING || oldBikeNetwork.ordinal() > newBikeNetwork.ordinal())
-                transformerRouteRelEnc.setEnum(false, relFlags, newBikeNetwork);
+                transformerRouteRelEnc.setEnum(false, -1, relIntAccess, newBikeNetwork);
         }
-
-        return relFlags;
     }
 
     @Override
-    public void createEncodedValues(EncodedValueLookup lookup, List<EncodedValue> registerNewEncodedValue) {
-        registerNewEncodedValue.add(bikeRouteEnc = new EnumEncodedValue<>(BikeNetwork.KEY, RouteNetwork.class));
-    }
-
-    @Override
-    public IntsRef handleWayTags(IntsRef edgeFlags, ReaderWay way, IntsRef relationFlags) {
+    public void handleWayTags(int edgeId, EdgeIntAccess edgeIntAccess, ReaderWay way, IntsRef relationFlags) {
         // just copy value into different bit range
-        RouteNetwork routeNetwork = transformerRouteRelEnc.getEnum(false, relationFlags);
-        bikeRouteEnc.setEnum(false, edgeFlags, routeNetwork);
-        return edgeFlags;
+        IntsRefEdgeIntAccess relIntAccess = new IntsRefEdgeIntAccess(relationFlags);
+        RouteNetwork routeNetwork = transformerRouteRelEnc.getEnum(false, -1, relIntAccess);
+        bikeRouteEnc.setEnum(false, edgeId, edgeIntAccess, routeNetwork);
+    }
+
+    public EnumEncodedValue<RouteNetwork> getTransformerRouteRelEnc() {
+        return transformerRouteRelEnc;
     }
 }

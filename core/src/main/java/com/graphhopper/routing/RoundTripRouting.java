@@ -21,16 +21,15 @@ import com.carrotsearch.hppc.IntHashSet;
 import com.carrotsearch.hppc.IntSet;
 import com.carrotsearch.hppc.cursors.IntCursor;
 import com.graphhopper.routing.util.EdgeFilter;
-import com.graphhopper.routing.util.FiniteWeightFilter;
 import com.graphhopper.routing.util.tour.MultiPointTour;
 import com.graphhopper.routing.util.tour.TourStrategy;
 import com.graphhopper.routing.weighting.AvoidEdgesWeighting;
-import com.graphhopper.routing.weighting.Weighting;
 import com.graphhopper.storage.index.LocationIndex;
 import com.graphhopper.storage.index.Snap;
 import com.graphhopper.util.DistanceCalcEarth;
 import com.graphhopper.util.PMap;
 import com.graphhopper.util.Parameters.Algorithms.RoundTrip;
+import com.graphhopper.util.PointList;
 import com.graphhopper.util.exceptions.PointNotFoundException;
 import com.graphhopper.util.shapes.GHPoint;
 
@@ -125,6 +124,11 @@ public class RoundTripRouting {
             int endNode = (endSnap == start) ? endSnap.getClosestNode() : endSnap.getClosestEdge().getBaseNode();
 
             Path path = roundTripCalculator.calcPath(startNode, endNode);
+            if (snapIndex == 1) {
+                result.wayPoints = new PointList(snaps.size(), path.graph.getNodeAccess().is3D());
+                result.wayPoints.add(path.graph.getNodeAccess(), startNode);
+            }
+            result.wayPoints.add(path.graph.getNodeAccess(), endNode);
             result.visitedNodes += pathCalculator.getVisitedNodes();
             result.paths.add(path);
         }
@@ -134,6 +138,7 @@ public class RoundTripRouting {
 
     public static class Result {
         public List<Path> paths;
+        public PointList wayPoints;
         public long visitedNodes;
 
         Result(int legs) {

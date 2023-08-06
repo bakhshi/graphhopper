@@ -4,21 +4,13 @@ import com.conveyal.gtfs.model.Stop;
 import com.google.protobuf.ByteString;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.gtfs.GtfsStorage;
-import com.graphhopper.gtfs.GtfsStorageI;
-import com.graphhopper.gtfs.PtEncodedValues;
+import com.graphhopper.gtfs.PtGraph;
 import com.graphhopper.matching.MatchResult;
-import com.graphhopper.util.EdgeIterator;
-import com.graphhopper.util.EdgeIteratorState;
 import com.graphhopper.util.Parameters;
 import com.graphhopper.util.shapes.BBox;
-import com.wdtinc.mapbox_vector_tile.VectorTile;
-import com.wdtinc.mapbox_vector_tile.adapt.jts.JtsAdapter;
-import com.wdtinc.mapbox_vector_tile.adapt.jts.TileGeomResult;
-import com.wdtinc.mapbox_vector_tile.adapt.jts.UserDataKeyValueMapConverter;
-import com.wdtinc.mapbox_vector_tile.build.MvtLayerBuild;
-import com.wdtinc.mapbox_vector_tile.build.MvtLayerParams;
-import com.wdtinc.mapbox_vector_tile.build.MvtLayerProps;
+import no.ecc.vectortile.VectorTileEncoder;
 import org.locationtech.jts.geom.*;
+import org.locationtech.jts.geom.util.AffineTransformation;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,36 +63,31 @@ public class PtMVTResource {
         if (!bbox.isValid())
             throw new IllegalStateException("Invalid bbox " + bbox);
 
-        List<Geometry> features = new ArrayList<>();
-        PtEncodedValues ptEncodedValues = PtEncodedValues.fromEncodingManager(graphHopper.getEncodingManager());
-        graphHopper.getLocationIndex().query(bbox, edgeId -> {
-            EdgeIteratorState edge = graphHopper.getGraphHopperStorage().getEdgeIteratorStateForKey(edgeId * 2);
-            EdgeIterator i = graphHopper.getGraphHopperStorage().createEdgeExplorer().setBaseNode(edge.getBaseNode());
-            while (i.next()) {
-                if (i.get(ptEncodedValues.getTypeEnc()) == GtfsStorage.EdgeType.EXIT_PT) {
-                    GtfsStorageI.PlatformDescriptor fromPlatformDescriptor = gtfsStorage.getPlatformDescriptorByEdge().get(i.getEdge());
+        VectorTileEncoder vectorTileEncoder = new VectorTileEncoder();
+        // 256x256 pixels per MVT. here we transform from the global coordinate system to the local one of the tile.
+        AffineTransformation affineTransformation = new AffineTransformation();
+        affineTransformation.translate(-nw.x, -se.y);
+        affineTransformation.scale(
+                256.0 / (se.x - nw.x),
+                -256.0 / (nw.y - se.y)
+        );
+        affineTransformation.translate(0, 256);
+        gtfsStorage.getStopIndex().query(bbox, edgeId -> {
+            for (PtGraph.PtEdge ptEdge : gtfsStorage.getPtGraph().backEdgesAround(edgeId)) {
+                if (ptEdge.getType() == GtfsStorage.EdgeType.EXIT_PT) {
+                    GtfsStorage.PlatformDescriptor fromPlatformDescriptor = ptEdge.getAttrs().platformDescriptor;
                     Stop stop = gtfsStorage.getGtfsFeeds().get(fromPlatformDescriptor.feed_id).stops.get(fromPlatformDescriptor.stop_id);
                     Map<String, Object> properties = new HashMap<>(2);
                     properties.put("feed_id", fromPlatformDescriptor.feed_id);
                     properties.put("stop_id", fromPlatformDescriptor.stop_id);
                     Point feature = geometryFactory.createPoint(new Coordinate(stop.stop_lon, stop.stop_lat));
                     feature.setUserData(properties);
-                    features.add(feature);
+                    Geometry g = affineTransformation.transform(feature);
+                    vectorTileEncoder.addFeature("stops", properties, g);
                 }
             }
         });
-        VectorTile.Tile.Builder mvtBuilder = VectorTile.Tile.newBuilder();
-        mvtBuilder.addLayers(createLayer(new Envelope(se, nw), new MvtLayerParams(256, 4096), features, "stops"));
-        return Response.ok(mvtBuilder.build().toByteArray(), PBF).build();
-    }
-
-    private VectorTile.Tile.Layer createLayer(Envelope tileEnvelope, MvtLayerParams layerParams, List<Geometry> locationReferences, String layerName) {
-        final VectorTile.Tile.Layer.Builder roadsLayerBuilder = MvtLayerBuild.newLayerBuilder(layerName, layerParams);
-        TileGeomResult tileGeom = JtsAdapter.createTileGeom(locationReferences, tileEnvelope, geometryFactory, layerParams, geometry -> true);
-        final MvtLayerProps roadsLayerProps = new MvtLayerProps();
-        roadsLayerBuilder.addAllFeatures(JtsAdapter.toFeatures(tileGeom.mvtGeoms, roadsLayerProps, new UserDataKeyValueMapConverter()));
-        MvtLayerBuild.writeProps(roadsLayerBuilder, roadsLayerProps);
-        return roadsLayerBuilder.build();
+        return Response.ok(vectorTileEncoder.encode(), PBF).build();
     }
 
     Coordinate num2deg(int xInfo, int yInfo, int zoom) {
